@@ -1,0 +1,2 @@
+fastapi
+yfinance>=0.2.40
