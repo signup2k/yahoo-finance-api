@@ -66,6 +66,9 @@ async def verify_api_key(request: Request, call_next):
 
 # ─── Helper Functions ─────────────────────────────────────────────────
 
+MAX_SYMBOLS = 20
+
+
 def _parse_symbols(symbols: str) -> list[str]:
     """Parse comma-separated symbols string into a list."""
     return [s.strip().upper() for s in symbols.split(",") if s.strip()]
@@ -128,6 +131,8 @@ def history(
     tickers = _parse_symbols(symbols)
     if not tickers:
         raise HTTPException(status_code=400, detail="No valid symbols provided")
+    if len(tickers) > MAX_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_SYMBOLS} symbols per request")
 
     end_date = end or date.today().isoformat()
     start_date = start or (date.today() - timedelta(days=365)).isoformat()
@@ -140,23 +145,24 @@ def history(
             df = ticker.history(start=start_date, end=end_date, interval=interval)
 
             if df.empty:
+                all_data.append({"symbol": symbol, "error": "No data available for the given range"})
                 continue
 
             df = df.reset_index()
-
-            for _, row in df.iterrows():
-                record = {
-                    "symbol": symbol,
-                    "trade_date": row.get("Date", row.get("Datetime", "")),
-                    "open": row.get("Open"),
-                    "high": row.get("High"),
-                    "low": row.get("Low"),
-                    "close": row.get("Close"),
-                    "volume": row.get("Volume"),
-                }
-                # Serialize dates and numpy types
-                record = {k: _safe_serialize(v) if v is not None else None for k, v in record.items()}
-                all_data.append(record)
+            date_col = "Date" if "Date" in df.columns else "Datetime"
+            df = df.rename(columns={
+                date_col: "trade_date", "Open": "open", "High": "high",
+                "Low": "low", "Close": "close", "Volume": "volume",
+            })
+            df["symbol"] = symbol
+            cols = ["symbol", "trade_date", "open", "high", "low", "close", "volume"]
+            records = df[cols].to_dict(orient="records")
+            for r in records:
+                r["trade_date"] = _safe_serialize(r["trade_date"])
+                for k in ("open", "high", "low", "close", "volume"):
+                    if r[k] is not None:
+                        r[k] = _safe_serialize(r[k])
+            all_data.extend(records)
         except Exception as e:
             all_data.append({"symbol": symbol, "error": str(e)})
 
@@ -173,6 +179,8 @@ def quote(
     tickers = _parse_symbols(symbols)
     if not tickers:
         raise HTTPException(status_code=400, detail="No valid symbols provided")
+    if len(tickers) > MAX_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_SYMBOLS} symbols per request")
 
     results = []
     for symbol in tickers:
@@ -222,9 +230,8 @@ def info(
         ticker = yf.Ticker(symbol)
         raw_info = ticker.info
 
-        if not raw_info or raw_info.get("trailingPegRatio") is None and len(raw_info) <= 1:
-            # yfinance sometimes returns minimal data for invalid tickers
-            pass
+        if not raw_info or len(raw_info) <= 1:
+            raise HTTPException(status_code=404, detail=f"No data found for symbol: {symbol}")
 
         # Serialize all values
         cleaned = {}
