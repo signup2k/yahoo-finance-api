@@ -16,6 +16,7 @@ Supports: **Stocks, ETFs, Indices, Mutual Funds, Commodities, Forex, and Crypto*
 | `/api/search` | GET | Search tickers by name/symbol |
 | `/api/dividends` | GET | Dividend history |
 | `/api/splits` | GET | Stock split history |
+| `/api/earnings-estimates` | GET | EarningsTrend-derived analyst estimate tables |
 
 ## Quick Examples
 
@@ -40,6 +41,12 @@ curl "https://your-app.vercel.app/api/info?symbol=AAPL" \
 ### Search Tickers
 ```bash
 curl "https://your-app.vercel.app/api/search?query=Apple" \
+  -H "X-API-Key: your-api-key"
+```
+
+### Get Earnings Estimates
+```bash
+curl "https://your-app.vercel.app/api/earnings-estimates?symbols=AAPL,MSFT" \
   -H "X-API-Key: your-api-key"
 ```
 
@@ -78,18 +85,38 @@ In Vercel Dashboard → Project Settings → Environment Variables:
 |----------|-------------|----------|
 | `API_KEY` | API authentication key | Optional (if empty, auth is disabled) |
 | `CORS_ORIGINS` | Allowed CORS origins (comma-separated) | Optional (defaults to `*`) |
+| `HISTORY_CACHE_TTL_SECONDS` | In-memory `/api/history` cache TTL | Optional (defaults to `3600`) |
+| `HISTORY_CACHE_MAX_ITEMS` | Maximum history cache entries per warm runtime | Optional (defaults to `512`) |
 
 ## Local Development
 
 ```bash
 pip install -r requirements.txt
-uvicorn api.index:app --reload --port 8000
+npm install
+npm run build
+API_KEY=this_is_awesome_yfinance uvicorn api.index:app --reload --port 8000
 ```
 
-Then visit `http://localhost:8000/docs` for interactive API documentation.
+Then visit:
+
+- `http://localhost:8000/` for the multi-asset dashboard
+- `http://localhost:8000/docs` for interactive API documentation
+
+## Dashboard
+
+The root page serves a React + Vite + ECharts research-style web app:
+
+- Normalized multi-asset price chart. Changing the time window automatically rebases each selected asset to `100` or `1` at the first available close inside that window.
+- Rolling correlation view. Enter a window length in trading days to calculate pairwise return correlations, with a latest-correlation heatmap and a selectable asset-pair history chart.
+- Interactive SVG charts with tooltips, legends, zoom controls, and hover emphasis.
+- Client-side history cache in `localStorage` so browser refreshes do not immediately re-request the API for the same symbol/range/window.
+- Server-side in-memory history cache so repeated API calls avoid reloading the same Yahoo Finance data during the cache TTL.
+- Default assets: `SPY,QQQ,TLT,GLD,USO,BTC-USD`. Any Yahoo Finance symbols supported by `/api/history` can be used.
 
 ## Tech Stack
 
 - **Runtime**: Python 3.12+ on Vercel Serverless Functions
 - **Framework**: FastAPI
+- **Frontend**: React, Vite, TypeScript
+- **Charts**: ECharts with SVG rendering
 - **Data Source**: yfinance (Yahoo Finance)

@@ -8,12 +8,15 @@ Yahoo Finance API — Vercel Serverless Functions
 from __future__ import annotations
 
 import os
+import time
+from collections import OrderedDict
 from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 import yfinance as yf
 
 # ─── App Setup ────────────────────────────────────────────────────────
@@ -36,6 +39,14 @@ app.add_middleware(
 
 # API Key from environment variable
 _API_KEY = os.environ.get("API_KEY", "")
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PUBLIC_DIR = os.path.join(_ROOT_DIR, "public")
+
+if os.path.isdir(_PUBLIC_DIR):
+    app.mount("/static", StaticFiles(directory=_PUBLIC_DIR), name="static")
+    _ASSETS_DIR = os.path.join(_PUBLIC_DIR, "assets")
+    if os.path.isdir(_ASSETS_DIR):
+        app.mount("/assets", StaticFiles(directory=_ASSETS_DIR), name="assets")
 
 
 # ─── Auth Middleware ──────────────────────────────────────────────────
@@ -45,11 +56,15 @@ async def verify_api_key(request: Request, call_next):
     """Verify API key for all /api/* endpoints (skip docs & health)."""
     path = request.url.path
 
-    # Skip auth for root, docs, openapi, and health
-    if path in ("/", "/docs", "/redoc", "/openapi.json", "/api/health"):
+    # Skip auth for the dashboard, docs, openapi, and health.
+    if path in ("/", "/docs", "/redoc", "/openapi.json", "/api/health") or path.startswith(("/static/", "/assets/")):
         return await call_next(request)
 
-    # If no API_KEY configured, skip auth entirely
+    # Only /api/* endpoints are protected.
+    if not path.startswith("/api/"):
+        return await call_next(request)
+
+    # If no API_KEY configured, skip auth entirely.
     if not _API_KEY:
         return await call_next(request)
 
@@ -67,6 +82,9 @@ async def verify_api_key(request: Request, call_next):
 # ─── Helper Functions ─────────────────────────────────────────────────
 
 MAX_SYMBOLS = 20
+HISTORY_CACHE_TTL_SECONDS = int(os.environ.get("HISTORY_CACHE_TTL_SECONDS", "3600"))
+HISTORY_CACHE_MAX_ITEMS = int(os.environ.get("HISTORY_CACHE_MAX_ITEMS", "512"))
+_history_cache: OrderedDict[tuple[str, str, str, str], tuple[float, list[dict]]] = OrderedDict()
 
 
 def _parse_symbols(symbols: str) -> list[str]:
@@ -83,11 +101,74 @@ def _safe_serialize(obj):
     return str(obj)
 
 
+def _clean_json_value(value: object) -> object:
+    """Convert pandas/numpy values and NaN-like values into JSON-safe values."""
+    if value is None or str(value) in ("nan", "NaT", "<NA>"):
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        return _clean_json_value(value.item())
+    if isinstance(value, dict):
+        return {str(k): _clean_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_json_value(v) for v in value]
+    return value
+
+
+def _dataframe_to_records(df: object) -> list[dict[str, object]]:
+    """Serialize a yfinance DataFrame with its period index restored as a column."""
+    if df is None or getattr(df, "empty", True):
+        return []
+
+    records_df = df.reset_index()
+    if "index" in records_df.columns and "period" not in records_df.columns:
+        records_df = records_df.rename(columns={"index": "period"})
+
+    records = []
+    for row in records_df.to_dict(orient="records"):
+        records.append({str(k): _clean_json_value(v) for k, v in row.items()})
+    return records
+
+
+def _get_history_cache(key: tuple[str, str, str, str]) -> Optional[list[dict]]:
+    """Return cached history records when the in-memory entry is still fresh."""
+    if HISTORY_CACHE_TTL_SECONDS <= 0:
+        return None
+
+    cached = _history_cache.get(key)
+    if not cached:
+        return None
+
+    saved_at, records = cached
+    if time.time() - saved_at > HISTORY_CACHE_TTL_SECONDS:
+        _history_cache.pop(key, None)
+        return None
+
+    _history_cache.move_to_end(key)
+    return records
+
+
+def _set_history_cache(key: tuple[str, str, str, str], records: list[dict]) -> None:
+    """Store a small in-memory cache for warm serverless/runtime instances."""
+    if HISTORY_CACHE_TTL_SECONDS <= 0:
+        return
+
+    _history_cache[key] = (time.time(), records)
+    _history_cache.move_to_end(key)
+    while len(_history_cache) > HISTORY_CACHE_MAX_ITEMS:
+        _history_cache.popitem(last=False)
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    """API root — service info."""
+    """Serve the dashboard when available; otherwise return service info."""
+    index_path = os.path.join(_PUBLIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+
     return {
         "service": "Yahoo Finance API",
         "version": "1.0.0",
@@ -100,6 +181,7 @@ def root():
             "/api/search",
             "/api/dividends",
             "/api/splits",
+            "/api/earnings-estimates",
         ],
     }
 
@@ -140,12 +222,20 @@ def history(
     all_data = []
 
     for symbol in tickers:
+        cache_key = (symbol, start_date, end_date, interval)
+        cached_records = _get_history_cache(cache_key)
+        if cached_records is not None:
+            all_data.extend(cached_records)
+            continue
+
         try:
             ticker = yf.Ticker(symbol)
             df = ticker.history(start=start_date, end=end_date, interval=interval)
 
             if df.empty:
-                all_data.append({"symbol": symbol, "error": "No data available for the given range"})
+                records = [{"symbol": symbol, "error": "No data available for the given range"}]
+                _set_history_cache(cache_key, records)
+                all_data.extend(records)
                 continue
 
             df = df.reset_index()
@@ -162,6 +252,7 @@ def history(
                 for k in ("open", "high", "low", "close", "volume"):
                     if r[k] is not None:
                         r[k] = _safe_serialize(r[k])
+            _set_history_cache(cache_key, records)
             all_data.extend(records)
         except Exception as e:
             all_data.append({"symbol": symbol, "error": str(e)})
@@ -209,6 +300,40 @@ def quote(
                 for k, v in result.items()
             }
             results.append(result)
+        except Exception as e:
+            results.append({"symbol": symbol, "error": str(e)})
+
+    return {"count": len(results), "data": results}
+
+
+@app.get("/api/earnings-estimates")
+def earnings_estimates(
+    symbols: str = Query(..., description="Comma-separated ticker symbols"),
+):
+    """
+    Get earningsTrend-derived analyst estimate tables.
+
+    Returns the four yfinance tables sourced from Yahoo Finance's
+    earningsTrend module: earnings_estimate, revenue_estimate, eps_trend,
+    and eps_revisions.
+    """
+    tickers = _parse_symbols(symbols)
+    if not tickers:
+        raise HTTPException(status_code=400, detail="No valid symbols provided")
+    if len(tickers) > MAX_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_SYMBOLS} symbols per request")
+
+    results = []
+    for symbol in tickers:
+        try:
+            ticker = yf.Ticker(symbol)
+            results.append({
+                "symbol": symbol,
+                "earnings_estimate": _dataframe_to_records(ticker.earnings_estimate),
+                "revenue_estimate": _dataframe_to_records(ticker.revenue_estimate),
+                "eps_trend": _dataframe_to_records(ticker.eps_trend),
+                "eps_revisions": _dataframe_to_records(ticker.eps_revisions),
+            })
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
 
