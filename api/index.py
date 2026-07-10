@@ -11,6 +11,7 @@ import os
 import time
 from collections import OrderedDict
 from datetime import date, timedelta
+from math import ceil
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Query
@@ -51,13 +52,20 @@ if os.path.isdir(_PUBLIC_DIR):
 
 # ─── Auth Middleware ──────────────────────────────────────────────────
 
+
 @app.middleware("http")
 async def verify_api_key(request: Request, call_next):
     """Verify API key for all /api/* endpoints (skip docs & health)."""
     path = request.url.path
 
     # Skip auth for the dashboard, docs, openapi, and health.
-    if path in ("/", "/docs", "/redoc", "/openapi.json", "/api/health") or path.startswith(("/static/", "/assets/")):
+    if path in (
+        "/",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/api/health",
+    ) or path.startswith(("/static/", "/assets/")):
         return await call_next(request)
 
     # Only /api/* endpoints are protected.
@@ -81,15 +89,159 @@ async def verify_api_key(request: Request, call_next):
 
 # ─── Helper Functions ─────────────────────────────────────────────────
 
-MAX_SYMBOLS = 20
+MAX_HISTORY_DATA_POINTS = int(os.environ.get("MAX_HISTORY_DATA_POINTS", "20000"))
+MAX_QUOTE_ROWS = int(os.environ.get("MAX_QUOTE_ROWS", "500"))
+MAX_EARNINGS_ESTIMATE_ROWS = int(os.environ.get("MAX_EARNINGS_ESTIMATE_ROWS", "2000"))
+MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "200"))
 HISTORY_CACHE_TTL_SECONDS = int(os.environ.get("HISTORY_CACHE_TTL_SECONDS", "3600"))
 HISTORY_CACHE_MAX_ITEMS = int(os.environ.get("HISTORY_CACHE_MAX_ITEMS", "512"))
-_history_cache: OrderedDict[tuple[str, str, str, str], tuple[float, list[dict]]] = OrderedDict()
+_history_cache: OrderedDict[tuple[str, str, str, str], tuple[float, list[dict]]] = (
+    OrderedDict()
+)
+
+VALID_HISTORY_INTERVALS = {
+    "1m",
+    "2m",
+    "5m",
+    "15m",
+    "30m",
+    "60m",
+    "90m",
+    "1h",
+    "1d",
+    "5d",
+    "1wk",
+    "1mo",
+    "3mo",
+}
+INTERVAL_SECONDS = {
+    "1m": 60,
+    "2m": 120,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "60m": 3600,
+    "90m": 5400,
+    "1h": 3600,
+    "1d": 86400,
+    "5d": 432000,
+    "1wk": 604800,
+    "1mo": 2592000,
+    "3mo": 7776000,
+}
+INTERVAL_MAX_LOOKBACK_DAYS = {
+    "1m": 8,
+    "2m": 60,
+    "5m": 60,
+    "15m": 60,
+    "30m": 60,
+    "90m": 60,
+    "60m": 730,
+    "1h": 730,
+}
 
 
 def _parse_symbols(symbols: str) -> list[str]:
-    """Parse comma-separated symbols string into a list."""
-    return [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    """Parse comma-separated symbols and de-duplicate while preserving order."""
+    parsed = []
+    seen = set()
+    for raw_symbol in symbols.split(","):
+        symbol = raw_symbol.strip().upper()
+        if symbol and symbol not in seen:
+            parsed.append(symbol)
+            seen.add(symbol)
+    return parsed
+
+
+def _parse_date_param(value: Optional[str], name: str) -> Optional[date]:
+    """Parse an optional ISO date query parameter."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"{name} must be a valid YYYY-MM-DD date"
+        )
+
+
+def _normalize_history_interval(interval: str) -> str:
+    """Validate and normalize a yfinance history interval."""
+    normalized = interval.strip().lower()
+    if normalized not in VALID_HISTORY_INTERVALS:
+        allowed = ",".join(sorted(VALID_HISTORY_INTERVALS))
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported interval. Allowed values: {allowed}"
+        )
+    return normalized
+
+
+def _enforce_data_budget(requested_rows: int, max_rows: int, label: str) -> None:
+    """Reject requests that would fetch or return too many rows."""
+    if requested_rows > max_rows:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} would require {requested_rows} rows; maximum is {max_rows}",
+        )
+
+
+def _enforce_symbol_limit(tickers: list[str]) -> None:
+    """Reject multi-symbol requests that could overwhelm upstream services."""
+    if len(tickers) > MAX_SYMBOLS_PER_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Request contains {len(tickers)} symbols; "
+                f"maximum is {MAX_SYMBOLS_PER_REQUEST}"
+            ),
+        )
+
+
+def _resolve_history_window(
+    start: Optional[str], end: Optional[str]
+) -> tuple[str, str, date, date]:
+    """Resolve and validate history start/end date query parameters."""
+    end_day = _parse_date_param(end, "end") or date.today()
+    start_day = _parse_date_param(start, "start") or (
+        date.today() - timedelta(days=365)
+    )
+
+    if end_day <= start_day:
+        raise HTTPException(status_code=400, detail="end must be after start")
+
+    return start_day.isoformat(), end_day.isoformat(), start_day, end_day
+
+
+def _enforce_history_interval_window(
+    start_day: date, end_day: date, interval: str
+) -> None:
+    """Validate interval-specific Yahoo Finance lookback limits before calling yfinance."""
+    max_days = INTERVAL_MAX_LOOKBACK_DAYS.get(interval)
+    if max_days is None:
+        return
+
+    oldest_allowed = date.today() - timedelta(days=max_days)
+    if start_day < oldest_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Interval {interval} is only available for roughly the last {max_days} days",
+        )
+
+    if (end_day - start_day).days > max_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Interval {interval} supports at most a {max_days}-day request window",
+        )
+
+
+def _estimate_history_rows(
+    symbol_count: int, start_day: date, end_day: date, interval: str
+) -> int:
+    """Estimate history rows to bound request size before fetching from Yahoo."""
+    interval_seconds = INTERVAL_SECONDS[interval]
+    range_seconds = max((end_day - start_day).days * 86400, interval_seconds)
+    rows_per_symbol = max(1, ceil(range_seconds / interval_seconds))
+    return symbol_count * rows_per_symbol
 
 
 def _safe_serialize(obj):
@@ -131,6 +283,80 @@ def _dataframe_to_records(df: object) -> list[dict[str, object]]:
     return records
 
 
+def _matching_column_level_value(columns: object, level: int, symbol: str) -> object:
+    """Find the original MultiIndex level value matching a normalized symbol."""
+    for value in columns.get_level_values(level):
+        if str(value).upper() == symbol:
+            return value
+    return None
+
+
+def _slice_download_history_frame(
+    download_df: object, symbol: str, symbol_count: int
+) -> object:
+    """Extract one symbol's OHLCV columns from a yfinance.download result."""
+    columns = getattr(download_df, "columns", None)
+    if columns is None:
+        return download_df
+
+    if getattr(columns, "nlevels", 1) > 1:
+        first_level_match = _matching_column_level_value(columns, 0, symbol)
+        if first_level_match is not None:
+            return download_df.xs(first_level_match, axis=1, level=0)
+
+        second_level_match = _matching_column_level_value(columns, 1, symbol)
+        if second_level_match is not None:
+            return download_df.xs(second_level_match, axis=1, level=1)
+
+        return None
+
+    return download_df if symbol_count == 1 else None
+
+
+def _history_frame_to_records(symbol: str, history_df: object) -> list[dict]:
+    """Serialize a single-symbol history DataFrame into API records."""
+    if history_df is None or getattr(history_df, "empty", True):
+        return [{"symbol": symbol, "error": "No data available for the given range"}]
+
+    df = history_df.reset_index()
+    date_col = (
+        "Date"
+        if "Date" in df.columns
+        else "Datetime"
+        if "Datetime" in df.columns
+        else df.columns[0]
+    )
+    df = df.rename(
+        columns={
+            date_col: "trade_date",
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+    )
+
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            df[col] = None
+
+    df["symbol"] = symbol
+    cols = ["symbol", "trade_date", "open", "high", "low", "close", "volume"]
+    records = []
+    for row in df[cols].to_dict(orient="records"):
+        cleaned = {str(k): _clean_json_value(v) for k, v in row.items()}
+        if any(
+            cleaned.get(k) is not None
+            for k in ("open", "high", "low", "close", "volume")
+        ):
+            records.append(cleaned)
+
+    if not records:
+        return [{"symbol": symbol, "error": "No data available for the given range"}]
+    return records
+
+
 def _get_history_cache(key: tuple[str, str, str, str]) -> Optional[list[dict]]:
     """Return cached history records when the in-memory entry is still fresh."""
     if HISTORY_CACHE_TTL_SECONDS <= 0:
@@ -161,6 +387,7 @@ def _set_history_cache(key: tuple[str, str, str, str], records: list[dict]) -> N
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────
+
 
 @app.get("/")
 def root():
@@ -194,10 +421,23 @@ def health():
 
 @app.get("/api/history")
 def history(
-    symbols: str = Query(..., description="Comma-separated ticker symbols, e.g. AAPL,MSFT,^GSPC"),
-    start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD). Defaults to 1 year ago."),
-    end: Optional[str] = Query(None, description="End date (YYYY-MM-DD). Defaults to today."),
-    interval: str = Query("1d", description="Data interval: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo"),
+    symbols: str = Query(
+        ..., description="Comma-separated ticker symbols, e.g. AAPL,MSFT,^GSPC"
+    ),
+    start: Optional[str] = Query(
+        None, description="Start date (YYYY-MM-DD). Defaults to 1 year ago."
+    ),
+    end: Optional[str] = Query(
+        None, description="End date (YYYY-MM-DD). Defaults to today."
+    ),
+    interval: str = Query(
+        "1d", description="Data interval: 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo"
+    ),
+    max_points: Optional[int] = Query(
+        None,
+        ge=1,
+        description="Maximum estimated/returned OHLCV rows. Defaults to server limit.",
+    ),
 ):
     """
     Get OHLCV historical price data.
@@ -213,49 +453,70 @@ def history(
     tickers = _parse_symbols(symbols)
     if not tickers:
         raise HTTPException(status_code=400, detail="No valid symbols provided")
-    if len(tickers) > MAX_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_SYMBOLS} symbols per request")
+    _enforce_symbol_limit(tickers)
 
-    end_date = end or date.today().isoformat()
-    start_date = start or (date.today() - timedelta(days=365)).isoformat()
+    normalized_interval = _normalize_history_interval(interval)
+    start_date, end_date, start_day, end_day = _resolve_history_window(start, end)
+    _enforce_history_interval_window(start_day, end_day, normalized_interval)
 
-    all_data = []
+    row_budget = max_points if max_points is not None else MAX_HISTORY_DATA_POINTS
+    if row_budget > MAX_HISTORY_DATA_POINTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_points cannot exceed server limit {MAX_HISTORY_DATA_POINTS}",
+        )
+    _enforce_data_budget(
+        _estimate_history_rows(len(tickers), start_day, end_day, normalized_interval),
+        row_budget,
+        "History request",
+    )
 
+    records_by_symbol = {}
+    missing_tickers = []
     for symbol in tickers:
-        cache_key = (symbol, start_date, end_date, interval)
+        cache_key = (symbol, start_date, end_date, normalized_interval)
         cached_records = _get_history_cache(cache_key)
         if cached_records is not None:
-            all_data.extend(cached_records)
-            continue
+            records_by_symbol[symbol] = cached_records
+        else:
+            missing_tickers.append(symbol)
 
+    if missing_tickers:
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(start=start_date, end=end_date, interval=interval)
-
-            if df.empty:
-                records = [{"symbol": symbol, "error": "No data available for the given range"}]
-                _set_history_cache(cache_key, records)
-                all_data.extend(records)
-                continue
-
-            df = df.reset_index()
-            date_col = "Date" if "Date" in df.columns else "Datetime"
-            df = df.rename(columns={
-                date_col: "trade_date", "Open": "open", "High": "high",
-                "Low": "low", "Close": "close", "Volume": "volume",
-            })
-            df["symbol"] = symbol
-            cols = ["symbol", "trade_date", "open", "high", "low", "close", "volume"]
-            records = df[cols].to_dict(orient="records")
-            for r in records:
-                r["trade_date"] = _safe_serialize(r["trade_date"])
-                for k in ("open", "high", "low", "close", "volume"):
-                    if r[k] is not None:
-                        r[k] = _safe_serialize(r[k])
-            _set_history_cache(cache_key, records)
-            all_data.extend(records)
+            download_df = yf.download(
+                tickers=missing_tickers,
+                start=start_date,
+                end=end_date,
+                interval=normalized_interval,
+                group_by="ticker",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+                multi_level_index=True,
+            )
         except Exception as e:
-            all_data.append({"symbol": symbol, "error": str(e)})
+            for symbol in missing_tickers:
+                records_by_symbol[symbol] = [{"symbol": symbol, "error": str(e)}]
+        else:
+            for symbol in missing_tickers:
+                symbol_df = _slice_download_history_frame(
+                    download_df, symbol, len(missing_tickers)
+                )
+                records = _history_frame_to_records(symbol, symbol_df)
+                _set_history_cache(
+                    (symbol, start_date, end_date, normalized_interval), records
+                )
+                records_by_symbol[symbol] = records
+
+    all_data = []
+    for symbol in tickers:
+        all_data.extend(
+            records_by_symbol.get(
+                symbol, [{"symbol": symbol, "error": "No data available"}]
+            )
+        )
+
+    _enforce_data_budget(len(all_data), row_budget, "History response")
 
     return {"count": len(all_data), "data": all_data}
 
@@ -270,8 +531,8 @@ def quote(
     tickers = _parse_symbols(symbols)
     if not tickers:
         raise HTTPException(status_code=400, detail="No valid symbols provided")
-    if len(tickers) > MAX_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_SYMBOLS} symbols per request")
+    _enforce_symbol_limit(tickers)
+    _enforce_data_budget(len(tickers), MAX_QUOTE_ROWS, "Quote request")
 
     results = []
     for symbol in tickers:
@@ -289,7 +550,9 @@ def quote(
                 "volume": getattr(info, "last_volume", None),
                 "market_cap": getattr(info, "market_cap", None),
                 "fifty_day_average": getattr(info, "fifty_day_average", None),
-                "two_hundred_day_average": getattr(info, "two_hundred_day_average", None),
+                "two_hundred_day_average": getattr(
+                    info, "two_hundred_day_average", None
+                ),
                 "currency": getattr(info, "currency", None),
                 "exchange": getattr(info, "exchange", None),
                 "timezone": getattr(info, "timezone", None),
@@ -320,20 +583,26 @@ def earnings_estimates(
     tickers = _parse_symbols(symbols)
     if not tickers:
         raise HTTPException(status_code=400, detail="No valid symbols provided")
-    if len(tickers) > MAX_SYMBOLS:
-        raise HTTPException(status_code=400, detail=f"Maximum {MAX_SYMBOLS} symbols per request")
+    _enforce_symbol_limit(tickers)
+    _enforce_data_budget(
+        len(tickers) * 16, MAX_EARNINGS_ESTIMATE_ROWS, "Earnings estimates request"
+    )
 
     results = []
     for symbol in tickers:
         try:
             ticker = yf.Ticker(symbol)
-            results.append({
-                "symbol": symbol,
-                "earnings_estimate": _dataframe_to_records(ticker.earnings_estimate),
-                "revenue_estimate": _dataframe_to_records(ticker.revenue_estimate),
-                "eps_trend": _dataframe_to_records(ticker.eps_trend),
-                "eps_revisions": _dataframe_to_records(ticker.eps_revisions),
-            })
+            results.append(
+                {
+                    "symbol": symbol,
+                    "earnings_estimate": _dataframe_to_records(
+                        ticker.earnings_estimate
+                    ),
+                    "revenue_estimate": _dataframe_to_records(ticker.revenue_estimate),
+                    "eps_trend": _dataframe_to_records(ticker.eps_trend),
+                    "eps_revisions": _dataframe_to_records(ticker.eps_revisions),
+                }
+            )
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
 
@@ -356,7 +625,9 @@ def info(
         raw_info = ticker.info
 
         if not raw_info or len(raw_info) <= 1:
-            raise HTTPException(status_code=404, detail=f"No data found for symbol: {symbol}")
+            raise HTTPException(
+                status_code=404, detail=f"No data found for symbol: {symbol}"
+            )
 
         # Serialize all values
         cleaned = {}
@@ -372,7 +643,9 @@ def info(
 
         return {"symbol": symbol, "data": cleaned}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch info for {symbol}: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch info for {symbol}: {str(e)}"
+        )
 
 
 @app.get("/api/search")
@@ -393,23 +666,27 @@ def search(
         quotes = []
         if hasattr(results, "quotes") and results.quotes:
             for q in results.quotes[:max_results]:
-                quotes.append({
-                    "symbol": q.get("symbol", ""),
-                    "name": q.get("shortname") or q.get("longname", ""),
-                    "exchange": q.get("exchange", ""),
-                    "type": q.get("quoteType", ""),
-                    "score": q.get("score", 0),
-                })
+                quotes.append(
+                    {
+                        "symbol": q.get("symbol", ""),
+                        "name": q.get("shortname") or q.get("longname", ""),
+                        "exchange": q.get("exchange", ""),
+                        "type": q.get("quoteType", ""),
+                        "score": q.get("score", 0),
+                    }
+                )
 
         news = []
         if hasattr(results, "news") and results.news:
             for n in results.news[:5]:
-                news.append({
-                    "title": n.get("title", ""),
-                    "publisher": n.get("publisher", ""),
-                    "link": n.get("link", ""),
-                    "published": n.get("providerPublishTime", ""),
-                })
+                news.append(
+                    {
+                        "title": n.get("title", ""),
+                        "publisher": n.get("publisher", ""),
+                        "link": n.get("link", ""),
+                        "published": n.get("providerPublishTime", ""),
+                    }
+                )
 
         return {"query": query, "quotes": quotes, "news": news}
     except Exception as e:
@@ -449,7 +726,9 @@ def dividends(
 
         return {"symbol": symbol, "count": len(data), "data": data}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch dividends: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch dividends: {str(e)}"
+        )
 
 
 @app.get("/api/splits")
@@ -478,8 +757,7 @@ def splits(
             sp = sp[sp.index <= end]
 
         data = [
-            {"date": idx.isoformat(), "ratio": float(val)}
-            for idx, val in sp.items()
+            {"date": idx.isoformat(), "ratio": float(val)} for idx, val in sp.items()
         ]
 
         return {"symbol": symbol, "count": len(data), "data": data}

@@ -26,6 +26,13 @@ curl "https://your-app.vercel.app/api/history?symbols=AAPL,MSFT&start=2025-01-01
   -H "X-API-Key: your-api-key"
 ```
 
+`/api/history` batches symbols through `yfinance.download`. Multi-symbol endpoints accept at most 200 unique symbols per request, while history requests are additionally limited by estimated/returned data rows. Use `max_points` to lower the per-request row budget when needed:
+
+```bash
+curl "https://your-app.vercel.app/api/history?symbols=AAPL,MSFT,NVDA&interval=1d&max_points=5000" \
+  -H "X-API-Key: your-api-key"
+```
+
 ### Get Real-time Quote
 ```bash
 curl "https://your-app.vercel.app/api/quote?symbols=AAPL,^GSPC,GC=F,EURUSD=X" \
@@ -85,8 +92,22 @@ In Vercel Dashboard → Project Settings → Environment Variables:
 |----------|-------------|----------|
 | `API_KEY` | API authentication key | Optional (if empty, auth is disabled) |
 | `CORS_ORIGINS` | Allowed CORS origins (comma-separated) | Optional (defaults to `*`) |
+| `MAX_SYMBOLS_PER_REQUEST` | Maximum unique symbols accepted by a multi-symbol endpoint | Optional (defaults to `200`) |
+| `MAX_HISTORY_DATA_POINTS` | Maximum estimated/returned `/api/history` OHLCV rows per request | Optional (defaults to `20000`) |
+| `MAX_QUOTE_ROWS` | Maximum `/api/quote` result rows per request | Optional (defaults to `500`) |
+| `MAX_EARNINGS_ESTIMATE_ROWS` | Maximum earnings-estimate table rows per request; each symbol is budgeted as 16 rows | Optional (defaults to `2000`) |
 | `HISTORY_CACHE_TTL_SECONDS` | In-memory `/api/history` cache TTL | Optional (defaults to `3600`) |
 | `HISTORY_CACHE_MAX_ITEMS` | Maximum history cache entries per warm runtime | Optional (defaults to `512`) |
+
+## Upstream Limits
+
+This API uses yfinance on top of Yahoo Finance's public endpoints. yfinance supports batch historical downloads with `tickers` as a string or list and threaded downloading. The practical limits are mainly request volume, Yahoo rate limiting, and interval/date availability:
+
+- Intraday history is limited by Yahoo/yfinance lookback windows.
+- `1m` history is constrained to roughly the last 8 days.
+- `2m`, `5m`, `15m`, `30m`, and `90m` history are constrained to roughly the last 60 days.
+- `60m`/`1h` history is constrained to roughly the last 730 days.
+- Daily and coarser intervals can request longer history, subject to the row budget and Yahoo availability.
 
 ## Local Development
 
